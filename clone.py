@@ -11,8 +11,8 @@ from typing import Dict, List
 # XC CONFIG (AS REQUESTED)
 # -------------------------------------------------
 
-BASE_URL = "https://xxxxx.console.ves.volterra.io/api/config"
-API_TOKEN = "xxxxxxx"
+BASE_URL = "https://xxxxxxx.console.ves.volterra.io/api/config"
+API_TOKEN = "xxxxxxxxx"
 
 # -------------------------------------------------
 # Session + Auth
@@ -76,6 +76,7 @@ class ObjectCopier:
 
     def find_dependencies(self, lb: Dict) -> List[Dict]:
         deps = []
+        seen_pools = set()  # Track unique pools to avoid duplicates
         spec = lb.get("spec", {})
 
         # App Firewall
@@ -88,18 +89,56 @@ class ObjectCopier:
             })
             print(f"     🔗 Found app_firewall: {app_fw['name']} ({app_fw['namespace']})")
 
-        # Origin Pools
-        for pool in spec.get("default_route_pools", []):
-            p = pool.get("pool")
+        # Origin Pools from default_route_pools
+        for pool_ref in spec.get("default_route_pools", []):
+            p = pool_ref.get("pool")
             if p and "name" in p:
-                deps.append({
-                    "kind": "origin_pool",
-                    "name": p["name"],
-                    "namespace": p["namespace"]
-                })
-                print(f"     🔗 Found origin_pool: {p['name']} ({p['namespace']})")
+                pool_key = (p["name"], p["namespace"])
+                if pool_key not in seen_pools:
+                    seen_pools.add(pool_key)
+                    deps.append({
+                        "kind": "origin_pool",
+                        "name": p["name"],
+                        "namespace": p["namespace"]
+                    })
+                    print(f"     🔗 Found origin_pool: {p['name']} ({p['namespace']})")
+
+        # Origin Pools from routes
+        for route in spec.get("routes", []):
+            # Handle simple_route
+            simple_route = route.get("simple_route", {})
+            for pool_ref in simple_route.get("origin_pools", []):
+                p = pool_ref.get("pool")
+                if p and "name" in p:
+                    pool_key = (p["name"], p["namespace"])
+                    if pool_key not in seen_pools:
+                        seen_pools.add(pool_key)
+                        deps.append({
+                            "kind": "origin_pool",
+                            "name": p["name"],
+                            "namespace": p["namespace"]
+                        })
+                        print(f"     🔗 Found origin_pool (from route): {p['name']} ({p['namespace']})")
 
         return deps
+
+    def find_healthcheck_dependency(self, pool: Dict) -> Dict:
+        """Find health check dependency in origin pool"""
+        spec = pool.get("spec", {})
+        
+        # Check for healthcheck reference
+        healthcheck = spec.get("healthcheck")
+        if isinstance(healthcheck, list) and len(healthcheck) > 0:
+            hc = healthcheck[0]
+            if isinstance(hc, dict) and "name" in hc:
+                print(f"     🔗 Found healthcheck: {hc['name']} ({hc.get('namespace', 'N/A')})")
+                return {
+                    "kind": "healthcheck",
+                    "name": hc["name"],
+                    "namespace": hc.get("namespace", spec.get("namespace", ""))
+                }
+        
+        return None
 
     # -------------------------
     # Object cleanup (CRITICAL)
@@ -177,10 +216,20 @@ class ObjectCopier:
             # Update namespace references in route pools and GC spec
             for route_key in ["default_route_pools", "routes"]:
                 if route_key in cleaned["spec"]:
-                    for pool_ref in cleaned["spec"][route_key]:
-                        if "pool" in pool_ref and isinstance(pool_ref["pool"], dict):
-                            if pool_ref["pool"].get("namespace") != "shared":
-                                pool_ref["pool"]["namespace"] = self.dest_namespace
+                    if route_key == "routes":
+                        # Handle routes separately as they have nested structure
+                        for route in cleaned["spec"]["routes"]:
+                            simple_route = route.get("simple_route", {})
+                            for pool_ref in simple_route.get("origin_pools", []):
+                                if "pool" in pool_ref and isinstance(pool_ref["pool"], dict):
+                                    if pool_ref["pool"].get("namespace") != "shared":
+                                        pool_ref["pool"]["namespace"] = self.dest_namespace
+                    else:
+                        # Handle default_route_pools
+                        for pool_ref in cleaned["spec"][route_key]:
+                            if "pool" in pool_ref and isinstance(pool_ref["pool"], dict):
+                                if pool_ref["pool"].get("namespace") != "shared":
+                                    pool_ref["pool"]["namespace"] = self.dest_namespace
 
             if "gc_spec" in cleaned["spec"]:
                 gc = cleaned["spec"]["gc_spec"]
@@ -207,6 +256,26 @@ class ObjectCopier:
             ]:
                 cleaned["spec"].pop(field, None)
 
+            # Update healthcheck namespace reference if present
+            if "healthcheck" in cleaned["spec"]:
+                healthcheck = cleaned["spec"]["healthcheck"]
+                if isinstance(healthcheck, list) and len(healthcheck) > 0:
+                    hc = healthcheck[0]
+                    if isinstance(hc, dict) and hc.get("namespace") != "shared":
+                        hc["namespace"] = self.dest_namespace
+
+        # -----------------------------
+        # Health Check specific
+        # -----------------------------
+        if kind == "healthcheck":
+            for field in [
+                "status",
+                "referring_objects",
+                "deleted_referred_objects",
+                "disabled_referred_objects",
+            ]:
+                cleaned["spec"].pop(field, None)
+
         return cleaned
 
     # -------------------------
@@ -222,6 +291,7 @@ class ObjectCopier:
             "app_firewall": "app_firewalls",
             "origin_pool": "origin_pools",
             "http_loadbalancer": "http_loadbalancers",
+            "healthcheck": "healthchecks",
         }[kind]
 
         check_path = f"/namespaces/{self.dest_namespace}/{plural}/{name}"
@@ -232,6 +302,13 @@ class ObjectCopier:
         print(f"\n📦 Copying {kind} {name}")
 
         src = self.get(f"/namespaces/{namespace}/{plural}/{name}")
+        
+        # If this is an origin pool, check for health check dependency
+        if kind == "origin_pool":
+            hc_dep = self.find_healthcheck_dependency(src)
+            if hc_dep:
+                self.copy_object(hc_dep["kind"], hc_dep["name"], hc_dep["namespace"])
+        
         cleaned = self.clean_object(src, kind)
 
         self.post(f"/namespaces/{self.dest_namespace}/{plural}", cleaned)
@@ -279,4 +356,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
