@@ -4,15 +4,14 @@ import argparse
 import json
 import sys
 import requests
-import random
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # -------------------------------------------------
 # XC CONFIG (AS REQUESTED)
 # -------------------------------------------------
 
-BASE_URL = "https://xxxxxxx.console.ves.volterra.io/api/config"
-API_TOKEN = "xxxxxxxxx"
+BASE_URL = "https://xxxxx.console.ves.volterra.io/api/config"
+API_TOKEN = "xxxxxx"
 
 # -------------------------------------------------
 # Session + Auth
@@ -38,9 +37,11 @@ def die(msg):
 # -------------------------------------------------
 
 class ObjectCopier:
-    def __init__(self, tenant: str, dest_namespace: str):
+    def __init__(self, tenant: str, dest_namespace: str, domain_name: str, cert_name: Optional[str] = None):
         self.tenant = tenant
         self.dest_namespace = dest_namespace
+        self.domain_name = domain_name
+        self.cert_name = cert_name
 
     # -------------------------
     # HTTP helpers
@@ -69,6 +70,36 @@ class ObjectCopier:
         url = f"{BASE_URL}{path}"
         r = SESSION.get(url)
         return r.status_code == 200
+
+    def verify_certificate(self) -> bool:
+        """Verify that the certificate exists in the destination namespace"""
+        if not self.cert_name:
+            return True
+        
+        cert_list_path = f"/namespaces/{self.dest_namespace}/certificates"
+        print(f"\n🔐 Verifying certificate: {self.cert_name}")
+        
+        try:
+            response = self.get(cert_list_path)
+            items = response.get("items", [])
+            
+            # Check if the certificate exists in the list
+            cert_found = any(
+                item.get("name") == self.cert_name 
+                for item in items
+            )
+            
+            if cert_found:
+                print(f"  ✅ Certificate {self.cert_name} found in {self.dest_namespace}")
+                return True
+            else:
+                available_certs = [item.get("name") for item in items]
+                print(f"  Available certificates: {', '.join(available_certs) if available_certs else 'None'}")
+                die(f"Certificate {self.cert_name} not found in namespace {self.dest_namespace}")
+                return False
+        except Exception as e:
+            die(f"Failed to verify certificate: {e}")
+            return False
 
     # -------------------------
     # Dependency discovery
@@ -181,37 +212,59 @@ class ObjectCopier:
             # Force host_name empty
             cleaned["spec"]["host_name"] = ""
 
-            # Remove any old https key
+            # Remove any old https/https_auto_cert keys
             cleaned["spec"].pop("https", None)
+            cleaned["spec"].pop("https_auto_cert", None)
 
-            # Add random suffix to domains
-            if "domains" in cleaned["spec"]:
-                suffix = random.randint(1000, 9999)
-                cleaned["spec"]["domains"] = [
-                    f"{domain.split('.')[0]}{suffix}.{'.'.join(domain.split('.')[1:])}"
-                    for domain in cleaned["spec"]["domains"]
-                ]
+            # Set domain name from CLI argument
+            cleaned["spec"]["domains"] = [self.domain_name]
+            print(f"  🌐 Setting domain: {self.domain_name}")
 
-            # Add proper https_auto_cert block
-            cleaned["spec"]["https_auto_cert"] = {
-                "add_hsts": False,
-                "coalescing_options": {"default_coalescing": {}},
-                "connection_idle_timeout": 120000,
-                "default_header": {},
-                "enable_path_normalize": {},
-                "header_transformation_type": {"legacy_header_transformation": {}},
-                "http_protocol_options": {"http_protocol_enable_v1_v2": {}},
-                "http_redirect": False,
-                "no_mtls": {},
-                "non_default_loadbalancer": {},
-                "port": 443,
-                "tls_config": {"default_security": {}},
-            }
-
-            # Remove old tls cert references
-            https_cfg = cleaned["spec"]["https_auto_cert"]
-            https_cfg.pop("tls_cert_params", None)
-            https_cfg.pop("tls_certificates", None)
+            # Configure HTTPS based on whether custom certificate is specified
+            if self.cert_name:
+                # Use custom certificate
+                print(f"  🔐 Configuring HTTPS with custom certificate: {self.cert_name}")
+                cleaned["spec"]["https"] = {
+                    "http_redirect": False,
+                    "add_hsts": False,
+                    "port": 443,
+                    "default_header": {},
+                    "enable_path_normalize": {},
+                    "non_default_loadbalancer": {},
+                    "header_transformation_type": {"legacy_header_transformation": {}},
+                    "connection_idle_timeout": 120000,
+                    "tls_cert_params": {
+                        "tls_config": {"default_security": {}},
+                        "certificates": [
+                            {
+                                "tenant": self.tenant,
+                                "namespace": self.dest_namespace,
+                                "name": self.cert_name,
+                                "kind": "certificate"
+                            }
+                        ],
+                        "no_mtls": {}
+                    },
+                    "http_protocol_options": {"http_protocol_enable_v1_v2": {}},
+                    "coalescing_options": {"default_coalescing": {}}
+                }
+            else:
+                # Use automatic certificate
+                print(f"  🔓 Configuring HTTPS with automatic certificate")
+                cleaned["spec"]["https_auto_cert"] = {
+                    "add_hsts": False,
+                    "coalescing_options": {"default_coalescing": {}},
+                    "connection_idle_timeout": 120000,
+                    "default_header": {},
+                    "enable_path_normalize": {},
+                    "header_transformation_type": {"legacy_header_transformation": {}},
+                    "http_protocol_options": {"http_protocol_enable_v1_v2": {}},
+                    "http_redirect": False,
+                    "no_mtls": {},
+                    "non_default_loadbalancer": {},
+                    "port": 443,
+                    "tls_config": {"default_security": {}},
+                }
 
             # Update namespace references in route pools and GC spec
             for route_key in ["default_route_pools", "routes"]:
@@ -319,6 +372,10 @@ class ObjectCopier:
     # -------------------------
 
     def copy_load_balancer(self, source_ns: str, lb_name: str):
+        # Verify certificate if custom cert is specified
+        if self.cert_name:
+            self.verify_certificate()
+
         print("\n🔍 Fetching load balancer")
         lb = self.get(f"/namespaces/{source_ns}/http_loadbalancers/{lb_name}")
 
@@ -344,14 +401,17 @@ class ObjectCopier:
 
 def main():
     parser = argparse.ArgumentParser(description="Copy XC HTTP Load Balancer")
-    parser.add_argument("source_namespace")
-    parser.add_argument("load_balancer")
-    parser.add_argument("dest_namespace")
-    parser.add_argument("--tenant", default="sdc-support-yqpfidyt")
+    parser.add_argument("source_namespace", help="Source namespace containing the load balancer")
+    parser.add_argument("load_balancer", help="Name of the load balancer to copy")
+    parser.add_argument("dest_namespace", help="Destination namespace for the copy")
+    parser.add_argument("domain_name", help="Domain name for the copied load balancer (e.g., example.com)")
+    parser.add_argument("--tenant", default="sdc-support-yqpfidyt", help="Tenant ID")
+    parser.add_argument("--certificate", 
+                       help="Name of custom certificate to use (if not specified, uses automatic certificate)")
 
     args = parser.parse_args()
 
-    copier = ObjectCopier(args.tenant, args.dest_namespace)
+    copier = ObjectCopier(args.tenant, args.dest_namespace, args.domain_name, args.certificate)
     copier.copy_load_balancer(args.source_namespace, args.load_balancer)
 
 if __name__ == "__main__":
